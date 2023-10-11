@@ -1,7 +1,7 @@
 #
 # whisper
 
-add_library(whisper-cpp STATIC
+add_library(whisper-cpp
     whisper.cpp
     )
 
