@@ -27,6 +27,8 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#define GPT2_MAX_NODES 4096
+
 static void ggml_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
@@ -144,7 +146,7 @@ struct gpt2_batch {
 };
 
 // load the model's weights from a file
-bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & vocab, int n_gpu_layers) {
+bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & vocab, int n_ctx, int n_gpu_layers) {
     printf("%s: loading model from '%s'\n", __func__, fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
@@ -286,7 +288,7 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
 #ifdef GGML_USE_CUBLAS
     if (n_gpu_layers > 0) {
         fprintf(stderr, "%s: using CUDA backend\n", __func__);
-        model.backend = ggml_backend_cuda_init();
+        model.backend = ggml_backend_cuda_init(0);
         if (!model.backend) {
             fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
         }
@@ -385,6 +387,9 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
             model.tensors["model/h" + std::to_string(i) + "/mlp/c_proj/b"]  = layer.c_mlp_proj_b;
         }
     }
+
+    // override the default training context with the user-provided
+    model.hparams.n_ctx = n_ctx;
 
     // key + value memory
     {
@@ -548,7 +553,7 @@ struct ggml_cgraph * gpt2_graph(
     const int32_t kv_head  = ggml_allocr_is_measure(allocr) ? n_ctx - n_tokens : kv_cache.head;
 
     // since we are using ggml-alloc, this buffer only needs enough space to hold the ggml_tensor and ggml_cgraph structs, but not the tensor data
-    static size_t buf_size = ggml_tensor_overhead()*GGML_MAX_NODES + ggml_graph_overhead();
+    static size_t buf_size = ggml_tensor_overhead()*GPT2_MAX_NODES + ggml_graph_overhead_custom(GPT2_MAX_NODES, false);
     static std::vector<uint8_t> buf(buf_size);
 
     struct ggml_init_params params = {
@@ -559,7 +564,7 @@ struct ggml_cgraph * gpt2_graph(
 
     struct ggml_context * ctx0 = ggml_init(params);
 
-    struct ggml_cgraph  * gf = ggml_new_graph(ctx0);
+    struct ggml_cgraph  * gf = ggml_new_graph_custom(ctx0, GPT2_MAX_NODES, false);
 
     struct ggml_tensor * inpL;
     if (batch.token) {
@@ -1013,7 +1018,7 @@ int main(int argc, char ** argv) {
     {
         const int64_t t_start_us = ggml_time_us();
 
-        if (!gpt2_model_load(params.model, model, vocab, params.n_gpu_layers)) {
+        if (!gpt2_model_load(params.model, model, vocab, params.n_ctx, params.n_gpu_layers)) {
             fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
             return 1;
         }
@@ -1029,30 +1034,20 @@ int main(int argc, char ** argv) {
     // keep this buffer alive while evaluating the model
     ggml_backend_buffer_t buf_compute;
 
+    const int n_parallel = params.n_parallel;
+    const int n_batch_max = std::max(embd_inp.size(), (size_t)n_parallel);
+
     // create a gpt2_batch
     // we use this object to submit token data for decoding
-    const int n_parallel = params.n_parallel;
-    gpt2_batch batch = gpt2_batch_init(std::max(embd_inp.size(), (size_t)n_parallel), 0);
+    gpt2_batch batch = gpt2_batch_init(n_batch_max, 0);
 
-    // evaluate the initial prompt
-    batch.n_tokens = embd_inp.size();
-
-    for (int32_t i = 0; i < batch.n_tokens; i++) {
-        batch.token[i]  = embd_inp[i];
-        batch.pos[i]    = i;
-        batch.seq_id[i] = 0;
-        batch.logits[i] = false;
-    }
-
-    // gpt2_decode will output logits only for the last token of the prompt
-    batch.logits[batch.n_tokens - 1] = true;
-
+    // prepare required memory and allocate the compute buffer
     struct ggml_allocr * allocr = NULL;
-    // allocate the compute buffer
     {
-         // alignment required by the backend
-        size_t align = ggml_backend_get_alignment(model.backend);
-        allocr = ggml_allocr_new_measure(align);
+        // create an allocator to measure the memory usage
+        allocr = ggml_allocr_new_measure_from_backend(model.backend);
+
+        batch.n_tokens = n_batch_max;
 
         // create the worst case graph for memory usage estimation
         struct ggml_cgraph * gf = gpt2_graph(model, allocr, batch);
@@ -1072,6 +1067,19 @@ int main(int argc, char ** argv) {
     int64_t t_predict_us = 0;
 
     std::vector<float> logits;
+
+    // evaluate the initial prompt
+    batch.n_tokens = embd_inp.size();
+
+    for (int32_t i = 0; i < batch.n_tokens; i++) {
+        batch.token[i]  = embd_inp[i];
+        batch.pos[i]    = i;
+        batch.seq_id[i] = 0;
+        batch.logits[i] = false;
+    }
+
+    // gpt2_decode will output logits only for the last token of the prompt
+    batch.logits[batch.n_tokens - 1] = true;
 
     if (gpt2_decode(model, allocr, batch, params.n_threads, logits) != 0) {
         printf("%s: gpt2_decode() failed\n", __func__);
@@ -1133,7 +1141,7 @@ int main(int argc, char ** argv) {
             }
 
             // is it an end of stream? -> mark the stream as finished
-            if (id == 50256 || n_cur == n_len - 1) {
+            if ((!params.ignore_eos && id == 50256) || n_cur == n_len - 1) {
                 i_batch[i] = -1;
                 printf("\n");
                 if (n_parallel > 1) {
